@@ -1,4 +1,4 @@
 node_modules
 serviceAccountKey.json
 .expo
-dist
+distgit push -u origin main

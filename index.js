@@ -2,6 +2,7 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const admin = require('firebase-admin');
 
+// Certifique-se de que o serviceAccountKey.json está na mesma pasta!
 const serviceAccount = require("./serviceAccountKey.json");
 
 admin.initializeApp({
@@ -29,6 +30,35 @@ function obterProximosDias() {
     return dias;
 }
 
+// FUNÇÃO NOVA: Para não repetir o código de salvar no banco e mandar a mensagem final
+async function finalizarAgendamento(cliente, idSessao, message) {
+    let dur = calcularDuracao(cliente.servicos);
+    let [h, m] = cliente.hora.split(':').map(Number);
+    let totalM = h * 60 + m + dur;
+    let hFim = `${String(Math.floor(totalM/60)).padStart(2,'0')}:${String(totalM%60).padStart(2,'0')}`;
+
+    await db.collection('pedidos').add({
+        nome_cliente: cliente.nome,
+        whatsapp: cliente.telefone, 
+        chat_id: idSessao, 
+        veiculo_modelo: cliente.veiculo,
+        veiculo_cor: cliente.cor,
+        veiculo_placa: cliente.placa,
+        servicos: cliente.servicos,
+        valor_total: cliente.total,
+        data_agendamento: cliente.data,
+        hora_inicio: cliente.hora,
+        hora_fim: hFim,
+        status: 'pendente',
+        notificado_lavando: false, 
+        notificado_concluido: false, 
+        data_criacao: new Date().toISOString()
+    });
+
+    message.reply(`🎉 *Agendamento Confirmado, ${cliente.nome}!*\n\n📅 *Data:* ${cliente.data.split('-').reverse().join('/')}\n⏰ *Horário:* ${cliente.hora} às ${hFim}\n🚗 *Veículo:* ${cliente.veiculo} (${cliente.cor})\n🛠️ *Serviços:* ${cliente.servicos.join(', ')}\n💰 *Total:* R$ ${cliente.total},00\n\n📍 Rua Rodamis Creti, 271.\nO Rogério te espera! 🚿✨`);
+    delete sessoes[idSessao];
+}
+
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox'] },
@@ -37,57 +67,35 @@ const client = new Client({
 
 client.on('qr', (qr) => qrcode.generate(qr, { small: true }));
 
-// =========================================================================
-// O ESPIÃO: AGORA VERIFICA O ID EXATO NO SERVIDOR DO WHATSAPP
-// =========================================================================
 client.on('ready', () => { 
-    console.log('🚀 Bot Online e Monitorando o Pátio com Validação de ID!');
+    console.log('🚀 Bot Online, Monitorando o Pátio e com Inteligência de Histórico!');
 
     db.collection('pedidos').onSnapshot((snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
             if (change.type === 'modified') {
                 const pedido = change.doc.data();
                 const idPedido = change.doc.id;
-                
+                const chatIdExato = pedido.chat_id;
+
+                if (!chatIdExato) return; 
+
                 try {
-                    // Pega o chat_id salvo na hora que o cliente falou com o bot
-                    let idParaEnviar = pedido.chat_id;
-
-                    // Se não tiver o chat_id, o bot "pergunta" pro WhatsApp qual o ID certo
-                    if (!idParaEnviar && pedido.whatsapp) {
-                        let numeroLimpo = pedido.whatsapp.replace(/\D/g, "");
-                        if (!numeroLimpo.startsWith('55')) numeroLimpo = '55' + numeroLimpo;
-                        
-                        // MÁGICA: getNumberId converte o telefone no ID (LID) correto do WhatsApp
-                        const contatoValidado = await client.getNumberId(numeroLimpo);
-                        
-                        if (contatoValidado) {
-                            idParaEnviar = contatoValidado._serialized;
-                        } else {
-                            console.log(`❌ WhatsApp não encontrou o número: ${numeroLimpo}`);
-                            return; // Para tudo e não tenta enviar
-                        }
-                    }
-
-                    if (pedido.status === 'lavando' && !pedido.notificado_lavando) {
-                        console.log(`=> Disparando Zap de INÍCIO para: ${pedido.nome_cliente}`);
-                        await client.sendMessage(idParaEnviar, `🚿 *Olá, ${pedido.nome_cliente}!*\n\nO Rogério acabou de iniciar o serviço no seu veículo. Capricho total em andamento! ✨`);
+                    if (pedido.status === 'lavando' && pedido.notificado_lavando !== true) {
                         await db.collection('pedidos').doc(idPedido).update({ notificado_lavando: true });
+                        await client.sendMessage(chatIdExato, `🚿 *Olá, ${pedido.nome_cliente}!*\n\nO Rogério acabou de iniciar o serviço no seu veículo. Capricho total em andamento! ✨`);
                     }
 
-                    if (pedido.status === 'concluido' && !pedido.notificado_concluido) {
-                        console.log(`=> Disparando Zap de CONCLUSÃO para: ${pedido.nome_cliente}`);
-                        await client.sendMessage(idParaEnviar, `✅ *Veículo Pronto, ${pedido.nome_cliente}!*\n\nO serviço foi finalizado. Sua nave está brilhando e pronta para ser retirada! 🚗✨`);
+                    if (pedido.status === 'concluido' && pedido.notificado_concluido !== true) {
                         await db.collection('pedidos').doc(idPedido).update({ notificado_concluido: true });
+                        await client.sendMessage(chatIdExato, `✅ *Veículo Pronto, ${pedido.nome_cliente}!*\n\nO serviço foi finalizado. Sua nave está brilhando e pronta para ser retirada! 🚗✨`);
                     }
                 } catch (error) {
-                    console.log('❌ Erro no envio automático:', error);
+                    console.log('Erro ao processar notificação:', error);
                 }
             }
         });
     });
 });
-// =========================================================================
 
 client.on('message', async message => {
     const idSessao = message.from;
@@ -114,6 +122,24 @@ client.on('message', async message => {
         else if (cliente.etapa === 2) {
             cliente.telefone = texto.replace(/\D/g, ""); 
             cliente.etapa = 3;
+            
+            // --- BUSCA O HISTÓRICO DO CLIENTE AQUI ---
+            const historicoSnap = await db.collection('pedidos').where('whatsapp', '==', cliente.telefone).get();
+            if (!historicoSnap.empty) {
+                const pedidosAntigos = [];
+                historicoSnap.forEach(doc => pedidosAntigos.push(doc.data()));
+                // Pega o pedido mais recente
+                pedidosAntigos.sort((a, b) => new Date(b.data_criacao) - new Date(a.data_criacao));
+                
+                const ultimo = pedidosAntigos[0];
+                cliente.hist_veiculo = ultimo.veiculo_modelo;
+                cliente.hist_cor = ultimo.veiculo_cor;
+                cliente.hist_placa = ultimo.veiculo_placa;
+                cliente.hist_diaSemana = new Date(ultimo.data_agendamento + 'T00:00:00').getDay();
+                cliente.hist_hora = ultimo.hora_inicio;
+            }
+            // -----------------------------------------
+
             return message.reply(`Perfeito! Escolha o serviço desejado (Número ou Nome):\n\n1️⃣ *Externa* (R$ 50)\n_Lavagem da lataria e rodas._\n\n2️⃣ *Interna* (R$ 40)\n_Aspiração e limpeza interna._\n\n3️⃣ *Completa* (R$ 80)\n_Externa + Interna + Cera._\n\n4️⃣ *Higienização* (R$ 150)\n_Bancos, teto e carpetes._\n\n5️⃣ *Finalização* (R$ 30)\n_Pretinho e perfume premium._`);
         }
         else if (cliente.etapa === 3) {
@@ -130,8 +156,77 @@ client.on('message', async message => {
             }
         }
         else if (cliente.etapa === 4) {
-            if (textoBaixo.includes('mais')) { cliente.etapa = 3; return message.reply('Qual o próximo serviço?'); }
-            else if (textoBaixo.includes('finalizar')) { cliente.etapa = 5; return message.reply('Ótima escolha! Agora os dados do veículo:\n\n👉 *Qual o modelo?*'); }
+            if (textoBaixo.includes('mais')) { 
+                cliente.etapa = 3; 
+                return message.reply('Qual o próximo serviço?'); 
+            }
+            else if (textoBaixo.includes('finalizar')) { 
+                // Se tiver histórico de veículo, vai pra etapa especial de confirmação
+                if (cliente.hist_veiculo) {
+                    cliente.etapa = 50;
+                    return message.reply(`Ótima escolha!\n\nVejo que seu último agendamento foi com o veículo:\n🚗 *${cliente.hist_veiculo}* (${cliente.hist_cor}) - Placa: *${cliente.hist_placa}*\n\nDeseja agendar para este mesmo veículo?\n1️⃣ Sim\n2️⃣ Não, cadastrar outro`);
+                } else {
+                    cliente.etapa = 5; 
+                    return message.reply('Ótima escolha! Agora os dados do veículo:\n\n👉 *Qual o modelo?*'); 
+                }
+            }
+        }
+        // ETAPA ESPECIAL 50: CONFIRMAR VEÍCULO ANTIGO
+        else if (cliente.etapa === 50) {
+            if (textoBaixo === '1' || textoBaixo.includes('sim')) {
+                cliente.veiculo = cliente.hist_veiculo;
+                cliente.cor = cliente.hist_cor;
+                cliente.placa = cliente.hist_placa;
+
+                // Se tem um padrão de horário, sugere ele
+                if (cliente.hist_diaSemana !== undefined && cliente.hist_hora) {
+                    const nomesDias = ["Domingo", "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado"];
+                    cliente.etapa = 51;
+                    return message.reply(`📅 Notei um padrão! Você costuma agendar de *${nomesDias[cliente.hist_diaSemana]} às ${cliente.hist_hora}*.\n\nDeseja verificar disponibilidade para o próximo *${nomesDias[cliente.hist_diaSemana]}* neste mesmo horário?\n1️⃣ Sim, manter padrão\n2️⃣ Escolher outra data/horário`);
+                } else {
+                    // Sem padrão de horário, vai escolher a data normal
+                    cliente.etapa = 8;
+                    const dias = obterProximosDias(); cliente.listaDias = dias;
+                    let m = `📅 *Escolha o dia para o agendamento:*\n\n`;
+                    dias.forEach((d, i) => m += `${i+1}️⃣ ${d.label}\n`);
+                    return message.reply(m);
+                }
+            } else {
+                cliente.etapa = 5;
+                return message.reply('Sem problemas! 👉 *Qual o modelo do novo veículo?*');
+            }
+        }
+        // ETAPA ESPECIAL 51: CONFIRMAR PADRÃO DE HORÁRIO
+        else if (cliente.etapa === 51) {
+            if (textoBaixo === '1' || textoBaixo.includes('sim')) {
+                const dias = obterProximosDias();
+                const diaAlvo = dias.find(d => new Date(d.data + 'T00:00:00').getDay() === cliente.hist_diaSemana);
+                
+                if (diaAlvo) {
+                    cliente.data = diaAlvo.data;
+                    cliente.hora = cliente.hist_hora;
+                    
+                    // Verifica se o horário alvo está livre
+                    const snap = await db.collection('pedidos').where('data_agendamento', '==', cliente.data).where('hora_inicio', '==', cliente.hora).get();
+                    
+                    if (snap.empty) {
+                        // Horário livre! Finaliza direto.
+                        return await finalizarAgendamento(cliente, idSessao, message);
+                    } else {
+                        // Ocupado
+                        cliente.etapa = 8;
+                        let m = `❌ Poxa, no próximo dia disponível para este padrão o horário já está ocupado.\n\n📅 *Escolha outro dia:*\n\n`;
+                        dias.forEach((d, i) => m += `${i+1}️⃣ ${d.label}\n`);
+                        return message.reply(m);
+                    }
+                }
+            }
+            // Se disse não ou se não encontrou o dia, vai para a escolha normal de data
+            cliente.etapa = 8;
+            const dias = obterProximosDias(); cliente.listaDias = dias;
+            let m = `📅 *Escolha o dia para o agendamento:*\n\n`;
+            dias.forEach((d, i) => m += `${i+1}️⃣ ${d.label}\n`);
+            return message.reply(m);
         }
         else if (cliente.etapa === 5) { cliente.veiculo = texto; cliente.etapa = 6; return message.reply(`👉 *Qual a cor do ${cliente.veiculo}?*`); }
         else if (cliente.etapa === 6) { cliente.placa = texto; cliente.etapa = 7; return message.reply(`👉 *Qual a placa?*`); }
@@ -162,31 +257,7 @@ client.on('message', async message => {
             const hIdx = parseInt(texto) - 1;
             if (cliente.listaHoras[hIdx]) {
                 cliente.hora = cliente.listaHoras[hIdx];
-                let dur = calcularDuracao(cliente.servicos);
-                let [h, m] = cliente.hora.split(':').map(Number);
-                let totalM = h * 60 + m + dur;
-                let hFim = `${String(Math.floor(totalM/60)).padStart(2,'0')}:${String(totalM%60).padStart(2,'0')}`;
-
-                await db.collection('pedidos').add({
-                    nome_cliente: cliente.nome,
-                    whatsapp: cliente.telefone, 
-                    chat_id: idSessao, // Salva o ID que o WhatsApp entende diretamente!
-                    veiculo_modelo: cliente.veiculo,
-                    veiculo_cor: cliente.cor,
-                    veiculo_placa: cliente.placa,
-                    servicos: cliente.servicos,
-                    valor_total: cliente.total,
-                    data_agendamento: cliente.data,
-                    hora_inicio: cliente.hora,
-                    hora_fim: hFim,
-                    status: 'pendente',
-                    notificado_lavando: false, 
-                    notificado_concluido: false, 
-                    data_criacao: new Date().toISOString()
-                });
-
-                message.reply(`🎉 *Agendamento Confirmado, ${cliente.nome}!*\n\n📅 *Data:* ${cliente.data.split('-').reverse().join('/')}\n⏰ *Horário:* ${cliente.hora} às ${hFim}\n🚗 *Veículo:* ${cliente.veiculo} (${cliente.cor})\n🛠️ *Serviços:* ${cliente.servicos.join(', ')}\n💰 *Total:* R$ ${cliente.total},00\n\n📍 Rua Rodamis Creti, 271.\nO Rogério te espera! 🚿✨`);
-                delete sessoes[idSessao];
+                await finalizarAgendamento(cliente, idSessao, message);
             }
         }
     } catch (e) { console.log(e); }
